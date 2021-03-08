@@ -11,6 +11,8 @@
 
   var userAgent = navigator.userAgent;
   var ONE_DAY_MILLIS = 24 * 60 * 60 * 1000;
+  var DEFAULT_POPUP_HEIGHT = 578;
+  var DEFAULT_POPUP_WIDTH = 433;
 
   /**
    * Unpollute sprintf functions from the global namespace.
@@ -205,6 +207,14 @@
     return enumObj;
   };
 
+  connect.makeGenericNamespacedEnum = function (prefix, values, delimiter) {
+    var enumObj = connect.makeEnum(values);
+    connect.keys(enumObj).forEach(function (key) {
+      enumObj[key] = connect.sprintf("%s"+delimiter+"%s", prefix, enumObj[key]);
+    });
+    return enumObj;
+  };
+
   /**
   * Methods to determine browser type and versions, used for softphone initialization.
   */
@@ -237,6 +247,52 @@
       return -1;
     }
   };
+
+  connect.isValidLocale = function (locale) {
+    var languages = [
+      {
+        id: 'en_US',
+        label: 'English'
+      },
+      {
+        id: 'de_DE',
+        label: 'Deutsch'
+      },
+      {
+        id: 'es_ES',
+        label: 'Español'
+      },
+      {
+        id: 'fr_FR',
+        label: 'Français'
+      },
+      {
+        id: 'ja_JP',
+        label: '日本語'
+      },
+      {
+        id: 'it_IT',
+        label: 'Italiano'
+      },
+      {
+        id: 'ko_KR',
+        label: '한국어'
+      },
+      {
+        id: 'pt_BR',
+        label: 'Português'
+      },
+      {
+        id: 'zh_CN',
+        label: '中文(简体)'
+      },
+      {
+        id: 'zh_TW',
+        label: '中文(繁體)'
+      }
+    ];
+    return languages.map(function(language){ return language.id}).includes(locale);
+  }
 
   connect.getOperaBrowserVersion = function () {
     var versionOffset = userAgent.indexOf("Opera");
@@ -328,6 +384,14 @@
     return connect.sprintf("%s//%s:%s", location.protocol, location.hostname, location.port);
   };
 
+  connect.getUrlWithProtocol = function(url) {
+    var protocol = global.location.protocol;
+    if (url.substr(0, protocol.length) !== protocol) {
+      return connect.sprintf("%s//%s", protocol, url);
+    }
+    return url;
+  }
+
   /**
    * Determine if the current window is in an iframe.
    * Courtesy: http://stackoverflow.com/questions/326069/
@@ -401,24 +465,52 @@
     bus.trigger(connect.EventType.CLIENT_METRIC, metricData);
   };
 
+  connect.publishSoftphoneStats = function(stats) {
+    var bus = connect.core.getEventBus();
+    bus.trigger(connect.EventType.SOFTPHONE_STATS, stats);
+  };
+
+  connect.publishSoftphoneReport = function(report) {
+    var bus = connect.core.getEventBus();
+    bus.trigger(connect.EventType.SOFTPHONE_REPORT, report);
+  };
+
+  connect.publishClientSideLogs = function(logs) {
+    var bus = connect.core.getEventBus();
+    bus.trigger(connect.EventType.CLIENT_SIDE_LOGS, logs);
+  };
+
   /**
    * A wrapper around Window.open() for managing single instance popups.
    */
   connect.PopupManager = function () { };
 
-  connect.PopupManager.prototype.open = function(url, name) {
+  connect.PopupManager.prototype.open = function (url, name, options) {
     var then = this._getLastOpenedTimestamp(name);
     var now = new Date().getTime();
-    var win = null;      
+    var win = null;
     if (now - then > ONE_DAY_MILLIS) {
-       win = window.open('', name);
-       if (win.location !== url) {
+      if (options) {
+        // default values are chosen to provide a minimum height without scrolling
+        // and a uniform margin based on the css of the ccp login page
+        var height = options.height || DEFAULT_POPUP_HEIGHT;
+        var width = options.width || DEFAULT_POPUP_WIDTH;
+        var top = options.top || 0;
+        var left = options.left || 0;
+        win = window.open('', name, "width="+width+", height="+height+", top="+top+", left="+left);
+        if (win.location !== url) {
+          win = window.open(url, name, "width="+width+", height="+height+", top="+top+", left="+left);
+        }
+      } else {
+        win = window.open('', name);
+        if (win.location !== url) {
           win = window.open(url, name);
-       }
-       this._setLastOpenedTimestamp(name, now);
+        }
+      }
+      this._setLastOpenedTimestamp(name, now);
     }
     return win;
- };
+  };
 
   connect.PopupManager.prototype.clear = function (name) {
     var key = this._getLocalStorageKey(name);
@@ -466,11 +558,11 @@
   connect.NotificationManager.prototype.requestPermission = function () {
     var self = this;
     if (!("Notification" in global)) {
-      connect.getLog().warn("This browser doesn't support notifications.");
+      connect.getLog().warn("This browser doesn't support notifications.").sendInternalLogToServer();
       this.permission = NotificationPermission.DENIED;
 
     } else if (global.Notification.permission === NotificationPermission.DENIED) {
-      connect.getLog().warn("The user has requested to not receive notifications.");
+      connect.getLog().warn("The user has requested to not receive notifications.").sendInternalLogToServer();
       this.permission = NotificationPermission.DENIED;
 
     } else if (this.permission !== NotificationPermission.GRANTED) {
@@ -491,15 +583,18 @@
       return this._showImpl({ title: title, options: options });
 
     } else if (this.permission === NotificationPermission.DENIED) {
-      connect.getLog().warn("Unable to show notification.").withObject({
-        title: title,
-        options: options
-      });
+      connect.getLog().warn("Unable to show notification.")
+        .sendInternalLogToServer()
+        .withObject({
+          title: title,
+          options: options
+        });
 
     } else {
       var params = { title: title, options: options };
       connect.getLog().warn("Deferring notification until user decides to allow or deny.")
-        .withObject(params);
+        .withObject(params)
+        .sendInternalLogToServer();
       this.queue.push(params);
     }
   };
@@ -552,5 +647,14 @@
   };
   connect.StateError.prototype = Object.create(connect.BaseError.prototype);
   connect.StateError.prototype.constructor = connect.StateError;
+
+  connect.VoiceIdError = function(type, message, err){
+    var error = {};
+    error.type = type;
+    error.message = message;
+    error.stack = Error(message);
+    error.err = err;
+    return error;
+  }
 
 })();

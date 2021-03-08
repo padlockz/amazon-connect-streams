@@ -62,23 +62,37 @@
   WorkerClient.prototype._callImpl = function (method, params, callbacks) {
     var self = this;
     var request_start = new Date().getTime();
-    connect.core.getClient()._callImpl(method, params, {
-      success: function (data) {
-        self._recordAPILatency(method, request_start);
-        callbacks.success(data);
-      },
-      failure: function (error, data) {
-        self._recordAPILatency(method, request_start, error);
-        callbacks.failure(error, data);
-      },
-      authFailure: function () {
-        self._recordAPILatency(method, request_start);
-        callbacks.authFailure();
-      },
-      accessDenied: function () {
-        callbacks.accessDenied && callbacks.accessDenied();
-      }
-    });
+    if(connect.containsValue(connect.AgentAppClientMethods, method)) {
+      connect.core.getAgentAppClient()._callImpl(method, params, {
+        success: function (data) {
+          self._recordAPILatency(method, request_start);
+          callbacks.success(data);
+        },
+        failure: function (error, data) {
+          self._recordAPILatency(method, request_start, error);
+          callbacks.failure(error, data);
+        }
+      })
+    } else {
+      connect.core.getClient()._callImpl(method, params, {
+        success: function (data) {
+          self._recordAPILatency(method, request_start);
+          callbacks.success(data);
+        },
+        failure: function (error, data) {
+          self._recordAPILatency(method, request_start, error);
+          callbacks.failure(error, data);
+        },
+        authFailure: function () {
+          self._recordAPILatency(method, request_start);
+          callbacks.authFailure();
+        },
+        accessDenied: function () {
+          callbacks.accessDenied && callbacks.accessDenied();
+        }
+      });
+    }
+    
   };
 
   WorkerClient.prototype._recordAPILatency = function (method, request_start, err) {
@@ -118,49 +132,33 @@
     this.portConduitMap = {};
     this.masterCoord = new MasterTopicCoordinator();
     this.logsBuffer = [];
+    this.suppress = false;
+    this.forceOffline = false;
 
     var webSocketManager = null;
 
     connect.rootLogger = new connect.DownstreamConduitLogger(this.conduit);
 
     this.conduit.onDownstream(connect.EventType.SEND_LOGS, function (logsToUpload) {
+      // Add softphone logs downstream
+      connect.getLog().pushLogsDownstream(logsToUpload);
+
       self.logsBuffer = self.logsBuffer.concat(logsToUpload);
       //only call API to send logs if buffer reached cap
       if (self.logsBuffer.length > LOG_BUFFER_CAP_SIZE) {
         self.handleSendLogsRequest(self.logsBuffer);
       }
     });
+
     this.conduit.onDownstream(connect.EventType.CONFIGURE, function (data) {
       if (data.authToken && data.authToken !== self.initData.authToken) {
         self.initData = data;
         connect.core.init(data);
-
-        // Start polling for agent data.
-        if (!self.agentPolling) {
-          connect.getLog().info("Kicking off agent polling");
-          self.agentPolling = true;
-          self.pollForAgent();
-        } else {
-          connect.getLog().info("Not kicking off new agent polling, since there's already polling going on");
-        }
-        if (!self.configPolling) {
-          connect.getLog().info("Kicking off config polling");
-          self.configPolling = true;
-          self.pollForAgentConfiguration({ repeatForever: true });
-        } else {
-          connect.getLog().info("Not kicking off new config polling, since there's already polling going on");
-        }
-        if (!global.checkAuthTokenInterval) {
-          connect.getLog().info("Kicking off auth token polling");
-          global.checkAuthTokenInterval = global.setInterval(connect.hitch(self, self.checkAuthToken), CHECK_AUTH_TOKEN_INTERVAL_MS);
-        } else {
-          connect.getLog().info("Not kicking off auth token polling, since there's already polling going on");
-        }
-
         // init only once.
         if (!webSocketManager) {
 
-          connect.getLog().info("Creating a new Websocket connection for CCP");
+          connect.getLog().info("Creating a new Websocket connection for CCP")
+            .sendInternalLogToServer();
 
           connect.WebSocketManager.setGlobalConfig({
             loggerConfig: { logger: connect.getLog() }
@@ -172,12 +170,22 @@
             self.conduit.sendDownstream(connect.WebSocketEvents.INIT_FAILURE);
           });
 
+          webSocketManager.onConnectionOpen(function (response) {
+            self.conduit.sendDownstream(connect.WebSocketEvents.CONNECTION_OPEN, response);
+          });
+
+          webSocketManager.onConnectionClose(function (response) {
+            self.conduit.sendDownstream(connect.WebSocketEvents.CONNECTION_CLOSE, response);
+          });
+
           webSocketManager.onConnectionGain(function () {
+            self.conduit.sendDownstream(connect.AgentEvents.WEBSOCKET_CONNECTION_GAINED);
             self.conduit.sendDownstream(connect.WebSocketEvents.CONNECTION_GAIN);
           });
 
-          webSocketManager.onConnectionLost(function () {
-            self.conduit.sendDownstream(connect.WebSocketEvents.CONNECTION_LOST);
+          webSocketManager.onConnectionLost(function (response) {
+            self.conduit.sendDownstream(connect.AgentEvents.WEBSOCKET_CONNECTION_LOST, response);
+            self.conduit.sendDownstream(connect.WebSocketEvents.CONNECTION_LOST, response);
           });
 
           webSocketManager.onSubscriptionUpdate(function (response) {
@@ -200,9 +208,30 @@
             webSocketManager.subscribeTopics(topics);
           });
 
-          webSocketManager.init(connect.hitch(self, self.getWebSocketUrl));
+          webSocketManager.init(connect.hitch(self, self.getWebSocketUrl)).then(function(response) {
+            if (response && !response.webSocketConnectionFailed) {
+              // Start polling for agent data.
+              connect.getLog().info("Kicking off agent polling")
+                .sendInternalLogToServer();
+              self.pollForAgent();
+
+              connect.getLog().info("Kicking off config polling")
+                .sendInternalLogToServer();
+              self.pollForAgentConfiguration({ repeatForever: true });
+
+              connect.getLog().info("Kicking off auth token polling")
+                .sendInternalLogToServer();
+              global.setInterval(connect.hitch(self, self.checkAuthToken), CHECK_AUTH_TOKEN_INTERVAL_MS);
+            } else {
+              if (!connect.webSocketInitFailed) {
+                self.conduit.sendDownstream(connect.WebSocketEvents.INIT_FAILURE);
+                connect.webSocketInitFailed = true;
+              }
+            }
+          });
         } else {
-          connect.getLog().info("Not Creating a Websocket instance, since there's already one exist");
+          connect.getLog().info("Not Initializing a new WebsocketManager instance, since one already exists")
+            .sendInternalLogToServer();
         }
       }
     });
@@ -254,7 +283,6 @@
 
   ClientEngine.prototype.pollForAgent = function () {
     var self = this;
-    var client = connect.core.getClient();
     var onAuthFail = connect.hitch(self, self.handleAuthFail);
 
     this.client.call(connect.ClientMethods.GET_AGENT_SNAPSHOT, {
@@ -268,10 +296,15 @@
             self.agent.snapshot.localTimestamp = connect.now();
             self.agent.snapshot.skew = self.agent.snapshot.snapshotTimestamp - self.agent.snapshot.localTimestamp;
             self.nextToken = data.nextToken;
-            connect.getLog().trace("GET_AGENT_SNAPSHOT succeeded.").withObject(data);
+            connect.getLog().trace("GET_AGENT_SNAPSHOT succeeded.")
+              .withObject(data)
+              .sendInternalLogToServer();
             self.updateAgent();
           } catch (e) {
-            connect.getLog().error("Long poll failed to update agent.").withObject(data).withException(e);
+            connect.getLog().error("Long poll failed to update agent.")
+              .withObject(data)
+              .withException(e)
+              .sendInternalLogToServer();
           } finally {
             global.setTimeout(connect.hitch(self, self.pollForAgent), GET_AGENT_SUCCESS_TIMEOUT_MS);
           }
@@ -279,6 +312,7 @@
         failure: function (err, data) {
           try {
             connect.getLog().error("Failed to get agent data.")
+              .sendInternalLogToServer()
               .withObject({
                 err: err,
                 data: data
@@ -289,7 +323,6 @@
           }
         },
         authFailure: function () {
-          self.agentPolling = false;
           onAuthFail();
         },
         accessDenied: connect.hitch(self, self.handleAccessDenied)
@@ -318,6 +351,7 @@
       failure: function (err, data) {
         try {
           connect.getLog().error("Failed to fetch agent configuration data.")
+            .sendInternalLogToServer()
             .withObject({
               err: err,
               data: data
@@ -330,7 +364,6 @@
         }
       },
       authFailure: function () {
-        self.configPolling = false;
         onAuthFail();
       },
       accessDenied: connect.hitch(self, self.handleAccessDenied)
@@ -362,6 +395,7 @@
         },
         failure: function (err, data) {
           connect.getLog().error("Failed to fetch agent states list.")
+            .sendInternalLogToServer()
             .withObject({
               err: err,
               data: data
@@ -397,6 +431,7 @@
         },
         failure: function (err, data) {
           connect.getLog().error("Failed to fetch agent permissions list.")
+            .sendInternalLogToServer()
             .withObject({
               err: err,
               data: data
@@ -431,6 +466,7 @@
         },
         failure: function (err, data) {
           connect.getLog().error("Failed to fetch dialable country codes list.")
+            .sendInternalLogToServer()
             .withObject({
               err: err,
               data: data
@@ -466,6 +502,7 @@
         },
         failure: function (err, data) {
           connect.getLog().error("Failed to fetch routing profile queues list.")
+            .sendInternalLogToServer()
             .withObject({
               err: err,
               data: data
@@ -487,8 +524,10 @@
       failure: function (err, data) {
         var response = connect.EventFactory.createResponse(connect.EventType.API_RESPONSE, request, data, JSON.stringify(err));
         portConduit.sendDownstream(response.event, response);
-        connect.getLog().error("'%s' API request failed: %s", request.method, err)
-          .withObject({ request: self.filterAuthToken(request), response: response });
+        connect.getLog().error("'%s' API request failed", request.method)
+          .withObject({ request: self.filterAuthToken(request), response: response })
+          .withException(err)
+          .sendInternalLogToServer();
       },
       authFailure: connect.hitch(self, self.handleAuthFail)
     });
@@ -544,19 +583,23 @@
       this.updateAgent();
 
     } else {
-      connect.getLog().trace("Waiting to update agent configuration until all config data has been fetched.");
+      connect.getLog().trace("Waiting to update agent configuration until all config data has been fetched.")
+        .sendInternalLogToServer();
     }
   };
 
   ClientEngine.prototype.updateAgent = function () {
     if (!this.agent) {
-      connect.getLog().trace("Waiting to update agent until the agent has been fully constructed.");
+      connect.getLog().trace("Waiting to update agent until the agent has been fully constructed.")
+        .sendInternalLogToServer();
 
     } else if (!this.agent.snapshot) {
-      connect.getLog().trace("Waiting to update agent until the agent snapshot is available.");
+      connect.getLog().trace("Waiting to update agent until the agent snapshot is available.")
+        .sendInternalLogToServer();
 
     } else if (!this.agent.configuration) {
-      connect.getLog().trace("Waiting to update agent until the agent configuration is available.");
+      connect.getLog().trace("Waiting to update agent until the agent configuration is available.")
+        .sendInternalLogToServer();
 
     } else {
       // Alias some of the properties for backwards compatibility.
@@ -590,12 +633,12 @@
       });
       this.agent.configuration.routingProfile.routingProfileId =
         this.agent.configuration.routingProfile.routingProfileARN;
-
+      
       this.conduit.sendDownstream(connect.AgentEvents.UPDATE, this.agent);
     }
   };
 
-  /**
+/**
  * Provides a websocket url through the create_transport API.
  * @returns a promise which, upon success, returns the response from the createTransport API.
  */
@@ -607,11 +650,12 @@
     return new Promise(function (resolve, reject) {
       client.call(connect.ClientMethods.CREATE_TRANSPORT, { transportType: connect.TRANSPORT_TYPES.WEB_SOCKET }, {
         success: function (data) {
-          connect.getLog().info("getWebSocketUrl succeeded");
+          connect.getLog().info("getWebSocketUrl succeeded").sendInternalLogToServer();
           resolve(data);
         },
         failure: function (err, data) {
           connect.getLog().error("getWebSocketUrl failed")
+            .sendInternalLogToServer()
             .withObject({
               err: err,
               data: data
@@ -619,12 +663,12 @@
           reject(Error("getWebSocketUrl failed"));
         },
         authFailure: function () {
-          connect.getLog().error("getWebSocketUrl Auth Failure");
+          connect.getLog().error("getWebSocketUrl Auth Failure").sendInternalLogToServer();
           reject(Error("Authentication failed while getting getWebSocketUrl"));
           onAuthFail();
         },
         accessDenied: function () {
-          connect.getLog().error("getWebSocketUrl Access Denied Failure");
+          connect.getLog().error("getWebSocketUrl Access Denied Failure").sendInternalLogToServer();
           reject(Error("Access Denied Failure while getting getWebSocketUrl"));
           onAccessDenied();
         }
@@ -651,10 +695,12 @@
     });
     this.client.call(connect.ClientMethods.SEND_CLIENT_LOGS, { logEvents: logEvents }, {
       success: function (data) {
-        connect.getLog().info("SendLogs request succeeded.");
+        connect.getLog().info("SendLogs request succeeded.").sendInternalLogToServer();
       },
       failure: function (err, data) {
-        connect.getLog().error("SendLogs request failed. %s", err);
+        connect.getLog().error("SendLogs request failed.")
+          .withObject(data).withException(err)
+          .sendInternalLogToServer();
       },
       authFailure: connect.hitch(self, self.handleAuthFail)
     });
@@ -678,7 +724,8 @@
 
     // refresh token 30 minutes before expiration
     if (expirationDate.getTime() < (currentTimeStamp + thirtyMins)) {
-      connect.getLog().info("Auth token expires at " + expirationDate + " Start refreshing token with retry.");
+      connect.getLog().info("Auth token expires at " + expirationDate + " Start refreshing token with retry.")
+        .sendInternalLogToServer();
       connect.backoff(connect.hitch(self, self.authorize), REFRESH_AUTH_TOKEN_INTERVAL_MS, REFRESH_AUTH_TOKEN_MAX_TRY);
     }
   };
@@ -688,13 +735,16 @@
     var self = this;
     connect.core.authorize(this.initData.authorizeEndpoint).then(function (response) {
       var expiration = new Date(response.expiration);
-      connect.getLog().info("Authorization succeded and the token expires at %s", expiration);
+      connect.getLog().info("Authorization succeeded and the token expires at %s", expiration)
+        .sendInternalLogToServer();
       self.initData.authToken = response.accessToken;
       self.initData.authTokenExpiration = expiration;
       connect.core.initClient(self.initData);
+      connect.core.initAgentAppClient(self.initData);
       callbacks.success();
     }).catch(function (response) {
-      connect.getLog().error("Authorization failed %s ", response);
+      connect.getLog().error("Authorization failed with code %s", response.status)
+        .sendInternalLogToServer();
       if (response.status === 401) {
         self.handleAuthFail();
       } else {

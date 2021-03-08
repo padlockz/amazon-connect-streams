@@ -1,12 +1,14 @@
-var istanbul = require('gulp-istanbul'), 
+var istanbul = require('gulp-istanbul'),
     mocha = require('gulp-mocha'),
     concat = require('gulp-concat'),
     gulp = require('gulp'),
     uglify = require('gulp-uglify'),
     rename = require('gulp-rename'),
-    watch = require('gulp-watch'),
     jshint = require('gulp-jshint'),
+    replace = require('gulp-replace'),
     pump = require('pump');
+    fs = require('fs');
+    path = require('path');
 
 var source = [ "src/aws-client.js",
     "src/sprintf.js",
@@ -23,21 +25,23 @@ var source = [ "src/aws-client.js",
     "src/softphone.js",
     "src/worker.js",
     "src/mediaControllers/*",
-   
-]; 
- 
+    "src/agent-app/agent-app.js",
+    "src/agent-app/app-registry.js"
+
+];
+
 gulp.task('pre-test', function () {
-  return gulp.src(['./src/*.js'])
-    // Covering files
-    .pipe(istanbul({includeUntested: false}))
-    // Force `require` to return covered files
-    .pipe(istanbul.hookRequire());
+    return gulp.src(['./src/*.js'])
+        // Covering files
+        .pipe(istanbul({includeUntested: false}))
+        // Force `require` to return covered files
+        .pipe(istanbul.hookRequire());
 });
- 
-gulp.task('test', gulp.series('pre-test', function () {
+
+gulp.task('test', gulp.series('pre-test', function (cb) {
   return gulp.src(['test/unit/**/*.spec.js'])
     .pipe(mocha({exit: true, showStack:true}))
-    .on('error', console.error)
+    .on('error', (err) => cb(err))
     // Creating the reports after tests ran
     .pipe(istanbul.writeReports());
 }));
@@ -47,15 +51,17 @@ gulp.task('watch', function() {
 });
 
 gulp.task('script', function (cb) {
+  var streamJs = sourceCode.streamJs;
   pump([
-    gulp.src(source),
+    gulp.src(streamJs.sources),
     jshint(),
+    replace("STREAMS_VERSION", process.env.npm_package_version),
     concat('connect-streams.js'),
     gulp.dest('./release/'),
     rename('connect-streams-min.js'),
     uglify(),
-    gulp.dest('./release/')
+    gulp.dest(DESTINATION_FOLDER)
   ], cb);
 });
 
-gulp.task('default',gulp.series('test','script'));
+gulp.task('default', gulp.series('script', 'test'));

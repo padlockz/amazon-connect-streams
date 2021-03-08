@@ -9,8 +9,11 @@
   global.connect = connect;
   global.lily = connect;
 
-  // How frequently logs should be collected and reported to shared worker.
-  var LOG_REPORT_INTERVAL_MILLIS = 5000;
+  // How frequently softphone logs should be collected and reported to shared worker.
+  var SOFTPHONE_LOG_REPORT_INTERVAL_MILLIS = 5000;
+
+  // How frequently logs should be collected and sent downstream
+  var LOGS_REPORT_INTERVAL_MILLIS = 5000;
 
   // The default log roll interval (30min)
   var DEFAULT_LOG_ROLL_INTERVAL = 1800000;
@@ -35,7 +38,8 @@
   var LogComponent = {
     CCP: "ccp",
     SOFTPHONE: "softphone",
-    CHAT: "chat"
+    CHAT: "chat",
+    TASK: "task"
   };
 
   /**
@@ -74,7 +78,7 @@
   */
 
   var isValidLogComponent = function (component) {
-    return [LogComponent.SOFTPHONE, LogComponent.CCP, LogComponent.CHAT].indexOf(component) !== -1;
+    return Object.values(LogComponent).indexOf(component) !== -1;
   };
 
   /**
@@ -85,6 +89,7 @@
     var firstArg = args.shift();
     var format;
     var component;
+
     if (isValidLogComponent(firstArg)) {
       component = firstArg;
       format = args.shift();
@@ -93,6 +98,7 @@
       format = firstArg;
       component = LogComponent.CCP;
     }
+
     return {
       format: format,
       component: component,
@@ -103,13 +109,15 @@
   /**
    * A log entry.
    *
+   * @param component The logging component.
    * @param level The log level of this log entry.
    * @param text The text contained in the log entry.
+   * @param loggerId The root logger id.
    *
    * Log entries are aware of their timestamp, order,
    * and can contain objects and exception stack traces.
    */
-  var LogEntry = function (component, level, text) {
+  var LogEntry = function (component, level, text, loggerId) {
     this.component = component;
     this.level = level;
     this.text = text;
@@ -117,10 +125,11 @@
     this.exception = null;
     this.objects = [];
     this.line = 0;
+    this.loggerId = loggerId;
   };
 
   LogEntry.fromObject = function (obj) {
-    var entry = new LogEntry(LogComponent.CCP, obj.level, obj.text);
+    var entry = new LogEntry(LogComponent.CCP, obj.level, obj.text, obj.loggerId);
 
     // Required to check for Date objects sent across frame boundaries
     if (Object.prototype.toString.call(obj.time) === '[object Date]') {
@@ -142,7 +151,7 @@
    * out of the given exception for JSON serialization.
    */
   var LoggedException = function (e) {
-    this.type = Object.prototype.toString.call(e);
+    this.type = (e instanceof Error) ? e.name : e.code || Object.prototype.toString.call(e);
     this.message = e.message;
     this.stack = e.stack ? e.stack.split('\n') : [];
   };
@@ -205,17 +214,28 @@
   };
 
   /**
+   * Indicate that this log entry should be sent to the server
+   * NOTE: This should be used for internal logs only
+   */
+  LogEntry.prototype.sendInternalLogToServer = function () {
+    connect.getLog()._serverBoundInternalLogs.push(this);
+    return this;
+  };
+
+  /**
    * The logger instance.
    */
   var Logger = function () {
     this._logs = [];
     this._rolledLogs = [];
     this._logsToPush = [];
+    this._serverBoundInternalLogs = [];
     this._echoLevel = LogLevelOrder.INFO;
     this._logLevel = LogLevelOrder.INFO;
     this._lineCount = 0;
     this._logRollInterval = 0;
     this._logRollTimer = null;
+    this._loggerId = new Date().getTime() + "-" + Math.random().toString(36).slice(2);
     this.setLogRollInterval(DEFAULT_LOG_ROLL_INTERVAL);
   };
 
@@ -275,18 +295,33 @@
    * @returns The new log entry.
    */
   Logger.prototype.write = function (component, level, text) {
-    var logEntry = new LogEntry(component, level, text);
+    var logEntry = new LogEntry(component, level, text, this.getLoggerId());
     this.addLogEntry(logEntry);
     return logEntry;
   };
 
   Logger.prototype.addLogEntry = function (logEntry) {
     this._logs.push(logEntry);
+
     //For now only send softphone logs only.
     //TODO add CCP logs once we are sure that no sensitive data is being logged.
     if (LogComponent.SOFTPHONE === logEntry.component) {
       this._logsToPush.push(logEntry);
     }
+
+    if (logEntry.level in LogLevelOrder &&
+      LogLevelOrder[logEntry.level] >= this._logLevel) {
+
+      if (LogLevelOrder[logEntry.level] >= this._echoLevel) {
+        CONSOLE_LOGGER_MAP[logEntry.getLevel()](logEntry.toString());
+      }
+
+      logEntry.line = this._lineCount++;
+    }
+  };
+
+  Logger.prototype.sendInternalLogEntryToServer = function (logEntry) {
+    this._serverBoundInternalLogs.push(logEntry);
 
     if (logEntry.level in LogLevelOrder &&
       LogLevelOrder[logEntry.level] >= this._logLevel) {
@@ -373,8 +408,40 @@
     return lines.join("\n");
   };
   
-  Logger.prototype.download = function(logName) {
-    var logBlob = new global.Blob([JSON.stringify(this._rolledLogs.concat(this._logs), undefined, 4)], ['text/plain']);
+  /**
+   * Download/Archive logs to a file, 
+   * By default, it returns all logs.
+   * To filter logs by the minimum log level set by setLogLevel or the default set in _logLevel, 
+   * pass in filterByLogLevel to true in options
+   * 
+   * @param options download options [Object|String]. 
+   * - of type Object: 
+   *   { logName: 'my-log-name',
+   *     filterByLogLevel: false, //download all logs
+   *   }
+   * - of type String (for backward compatibility), the file's name
+   */
+  Logger.prototype.download = function(options) {
+    var logName = 'agent-log';
+    var filterByLogLevel = false;
+
+    if (typeof options === 'object') {
+      logName = options.logName || logName;
+      filterByLogLevel = options.filterByLogLevel || filterByLogLevel;
+    }
+    else if (typeof options === 'string') {
+      logName = options || logName;
+    }
+
+    var self = this;
+    var logs = this._rolledLogs.concat(this._logs);
+    if (filterByLogLevel) {
+      logs = logs.filter(function(entry) {
+        return LogLevelOrder[entry.level] >= self._logLevel;
+      });
+    }
+
+    var logBlob = new global.Blob([JSON.stringify(logs, undefined, 4)], ['text/plain']);
     var downloadLink = document.createElement('a');
     var logName = logName || 'agent-log';
     downloadLink.href = global.URL.createObjectURL(logBlob);
@@ -388,7 +455,7 @@
     if (!connect.upstreamLogPushScheduled) {
       connect.upstreamLogPushScheduled = true;
       /** Schedule pushing logs frequently to sharedworker upstream, sharedworker will report to LARS*/
-      global.setInterval(connect.hitch(this, this.reportMasterLogsUpStream, conduit), LOG_REPORT_INTERVAL_MILLIS);
+      global.setInterval(connect.hitch(this, this.reportMasterLogsUpStream, conduit), SOFTPHONE_LOG_REPORT_INTERVAL_MILLIS);
     }
   };
 
@@ -402,9 +469,37 @@
     });
   };
 
+  Logger.prototype.getLoggerId = function () {
+    return this._loggerId;
+  };
+
+  Logger.prototype.scheduleDownstreamClientSideLogsPush = function () {
+    global.setInterval(connect.hitch(this, this.pushClientSideLogsDownstream), LOGS_REPORT_INTERVAL_MILLIS);
+  }
+
+  Logger.prototype.pushClientSideLogsDownstream = function () {
+    var logs = [];
+
+    // We do not send a request if we have less than 50 records so that we minimize the number of
+    // requests per second. 
+    // 500 is the max we accept on the server. 
+    // We chose 500 because this is the limit imposed by Firehose for a put batch request
+    if (this._serverBoundInternalLogs.length < 50) {
+      return;
+    } else if (this._serverBoundInternalLogs.length > 500) {
+      logs = this._serverBoundInternalLogs.splice(0, 500);
+    } else {
+      logs = this._serverBoundInternalLogs;
+      this._serverBoundInternalLogs = [];
+    }
+
+    connect.publishClientSideLogs(logs);
+  }
+
   var DownstreamConduitLogger = function (conduit) {
     Logger.call(this);
     this.conduit = conduit;
+    
     global.setInterval(connect.hitch(this, this._pushLogsDownstream),
       DownstreamConduitLogger.LOG_PUSH_INTERVAL);
 
@@ -418,12 +513,26 @@
   DownstreamConduitLogger.prototype = Object.create(Logger.prototype);
   DownstreamConduitLogger.prototype.constructor = DownstreamConduitLogger;
 
+  DownstreamConduitLogger.prototype.pushLogsDownstream = function (logs) {
+    var self = this;
+    logs.forEach(function (log) {
+      self.conduit.sendDownstream(connect.EventType.LOG, log);
+    });
+  };
+
   DownstreamConduitLogger.prototype._pushLogsDownstream = function () {
     var self = this;
+    
     this._logs.forEach(function (log) {
       self.conduit.sendDownstream(connect.EventType.LOG, log);
     });
     this._logs = [];
+
+    for (var i = 0; i < this._serverBoundInternalLogs.length; i++) {
+      this.conduit.sendDownstream(connect.EventType.SERVER_BOUND_INTERNAL_LOG, this._serverBoundInternalLogs[i]);
+    }
+
+    this._serverBoundInternalLogs = [];
   };
 
   /** Create the singleton logger instance. */

@@ -33,7 +33,12 @@
     'broadcast',
     'api_metric',
     'client_metric',
-    'mute'
+    'softphone_stats',
+    'softphone_report',
+    'client_side_logs',
+    'server_bound_internal_log',
+    'mute',
+    "iframe_style"
   ]);
 
   /**---------------------------------------------------------------
@@ -61,9 +66,12 @@
     'offline',
     'error',
     'softphone_error',
+    'websocket_connection_lost',
+    'websocket_connection_gained',
     'state_change',
     'acw',
-    'mute_toggle'
+    'mute_toggle',
+    'local_media_stream_created'
   ]);
 
   /**---------------------------------------------------------------
@@ -71,6 +79,9 @@
   */
   var WebSocketEvents = connect.makeNamespacedEnum('webSocket', [
     'init_failure',
+    'connection_open',
+    'connection_close',
+    'connection_error',
     'connection_gain',
     'connection_lost',
     'subscription_update',
@@ -105,6 +116,19 @@
   */
   var ConnnectionEvents = connect.makeNamespacedEnum('connection', [
     'session_init'
+  ]);
+
+  /**---------------------------------------------------------------
+   * enum Configuration Events
+   */
+  var ConfigurationEvents = connect.makeNamespacedEnum('configuration', [
+    'configure',
+    'set_speaker_device',
+    'set_microphone_device',
+    'set_ringer_device',
+    'speaker_device_changed',
+    'microphone_device_changed',
+    'ringer_device_changed'
   ]);
 
   /**---------------------------------------------------------------
@@ -253,16 +277,29 @@
     var allEventSubs = this.subMap.getSubscriptions(ALL_EVENTS);
     var eventSubs = this.subMap.getSubscriptions(eventName);
 
-    if (this.logEvents && (eventName !== connect.EventType.LOG && eventName !== connect.EventType.MASTER_RESPONSE && eventName !== connect.EventType.API_METRIC)) {
-      connect.getLog().trace("Publishing event: %s", eventName);
+    if (this.logEvents &&
+        eventName !== connect.EventType.LOG &&
+        eventName !== connect.EventType.MASTER_RESPONSE &&
+        eventName !== connect.EventType.API_METRIC &&
+        eventName !== connect.EventType.SERVER_BOUND_INTERNAL_LOG
+    ) {
+      connect.getLog().trace("Publishing event: %s", eventName).sendInternalLogToServer();
+    }
+
+    if (
+      eventName.startsWith(connect.ContactEvents.ACCEPTED) &&
+      data &&
+      data.contactId &&
+      !(data instanceof connect.Contact)
+    ) {
+      data = new connect.Contact(data.contactId);
     }
 
     allEventSubs.concat(eventSubs).forEach(function (sub) {
       try {
         sub.f(data || null, eventName, self);
-
       } catch (e) {
-        connect.getLog().error("'%s' event handler failed.", eventName).withException(e);
+        connect.getLog().error("'%s' event handler failed.", eventName).withException(e).sendInternalLogToServer();
       }
     });
   };
@@ -293,8 +330,10 @@
   connect.EventFactory = EventFactory;
   connect.EventType = EventType;
   connect.AgentEvents = AgentEvents;
+  connect.ConfigurationEvents = ConfigurationEvents;
   connect.ConnnectionEvents = ConnnectionEvents;
   connect.ContactEvents = ContactEvents;
   connect.WebSocketEvents = WebSocketEvents;
   connect.MasterTopics = MasterTopics;
+  connect.DisasterRecoveryEvents = DisasterRecoveryEvents;
 })();
